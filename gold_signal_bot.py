@@ -22,6 +22,10 @@ MACD_SIGNAL = 9
 SL_USD = 3.0   # jarak Stop Loss dalam USD (harga gold), sesuaikan sesuai selera
 TP_USD = 6.0   # jarak Take Profit dalam USD
 
+H1_INTERVAL = "1h"
+H1_EMA_FAST = 50
+H1_EMA_SLOW = 200
+
 STATE_FILE = "state.json"
 
 TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
@@ -52,6 +56,44 @@ def fetch_candles():
     return df
 
 
+def fetch_h1_trend():
+    """
+    Ambil data H1 dan tentukan arah trend besar pakai EMA50 vs EMA200.
+    Return "bullish", "bearish", atau None kalau data belum cukup.
+    """
+    url = "https://api.twelvedata.com/time_series"
+    params = {
+        "symbol": SYMBOL,
+        "interval": H1_INTERVAL,
+        "outputsize": H1_EMA_SLOW + 20,
+        "apikey": TWELVEDATA_API_KEY,
+    }
+    resp = requests.get(url, params=params, timeout=20)
+    data = resp.json()
+
+    if data.get("status") == "error" or "values" not in data:
+        print("Gagal ambil data H1:", data)
+        return None
+
+    df = pd.DataFrame(data["values"])
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df["close"] = df["close"].astype(float)
+    df = df.sort_values("datetime").reset_index(drop=True)
+
+    if len(df) < H1_EMA_SLOW + 5:
+        return None  # data H1 belum cukup buat EMA200 stabil
+
+    ema_fast = df["close"].ewm(span=H1_EMA_FAST, adjust=False).mean()
+    ema_slow = df["close"].ewm(span=H1_EMA_SLOW, adjust=False).mean()
+
+    # pakai candle H1 yang sudah close (-2), skip yang mungkin masih jalan (-1)
+    if ema_fast.iloc[-2] > ema_slow.iloc[-2]:
+        return "bullish"
+    elif ema_fast.iloc[-2] < ema_slow.iloc[-2]:
+        return "bearish"
+    return None
+
+
 def calculate_indicators(df):
     """Hitung RSI dan MACD, tambahkan sebagai kolom baru."""
     close = df["close"]
@@ -74,13 +116,17 @@ def calculate_indicators(df):
     return df
 
 
-def detect_signal(df):
+def detect_signal(df, h1_trend):
     """
     Pakai 2 candle yang SUDAH close (index -2 dan -3), skip candle terakhir
     (-1) karena kemungkinan belum close saat data diambil.
+    Sinyal hanya diambil kalau searah dengan trend H1 (EMA50 vs EMA200).
     """
     if len(df) < MACD_SLOW + MACD_SIGNAL + 5:
         return None  # data belum cukup buat hitung indikator stabil
+
+    if h1_trend is None:
+        return None  # data H1 belum cukup, skip demi keamanan
 
     prev = df.iloc[-3]
     curr = df.iloc[-2]
@@ -94,7 +140,8 @@ def detect_signal(df):
     signal_time = str(curr["datetime"])
     entry_price = float(curr["close"])
 
-    if bullish_cross and rsi_bullish:
+    # BUY hanya kalau trend H1 juga bullish, SELL hanya kalau trend H1 bearish
+    if bullish_cross and rsi_bullish and h1_trend == "bullish":
         return {
             "type": "BUY",
             "time": signal_time,
@@ -102,8 +149,9 @@ def detect_signal(df):
             "sl": round(entry_price - SL_USD, 2),
             "tp": round(entry_price + TP_USD, 2),
             "rsi": round(float(curr["rsi"]), 1),
+            "h1_trend": h1_trend,
         }
-    elif bearish_cross and rsi_bearish:
+    elif bearish_cross and rsi_bearish and h1_trend == "bearish":
         return {
             "type": "SELL",
             "time": signal_time,
@@ -111,6 +159,7 @@ def detect_signal(df):
             "sl": round(entry_price + SL_USD, 2),
             "tp": round(entry_price - TP_USD, 2),
             "rsi": round(float(curr["rsi"]), 1),
+            "h1_trend": h1_trend,
         }
     return None
 
@@ -137,12 +186,14 @@ def send_telegram(message):
 
 def format_message(signal):
     emoji = "🟢 BUY" if signal["type"] == "BUY" else "🔴 SELL"
+    trend_label = "Bullish 📈" if signal["h1_trend"] == "bullish" else "Bearish 📉"
     return (
         f"{emoji} XAUUSD (M5)\n"
         f"Entry: {signal['entry']}\n"
         f"SL: {signal['sl']}\n"
         f"TP: {signal['tp']}\n"
         f"RSI: {signal['rsi']}\n"
+        f"Trend H1: {trend_label}\n"
         f"Candle: {signal['time']} UTC\n\n"
         f"⚠️ Sinyal otomatis, entry manual di MT5. Harga real bisa sedikit beda "
         f"dari harga di sinyal ini, cek ulang sebelum entry."
@@ -154,12 +205,15 @@ def main():
         print("Environment variable belum lengkap (API key / Telegram token / chat id).")
         sys.exit(1)
 
+    h1_trend = fetch_h1_trend()
+    print("Trend H1 saat ini:", h1_trend)
+
     df = fetch_candles()
     df = calculate_indicators(df)
-    signal = detect_signal(df)
+    signal = detect_signal(df, h1_trend)
 
     if signal is None:
-        print("Tidak ada sinyal baru saat ini.")
+        print("Tidak ada sinyal baru saat ini (atau tidak searah trend H1).")
         return
 
     state = load_state()
