@@ -1,5 +1,12 @@
 {
   "startingBalanceCents": 771.86,
   "targetBalanceCents": 1000.0,
-  "trades": []
+  "trades": [
+    {
+      "result": "win",
+      "plCents": 8.06,
+      "dateTime": "2026-09-10T05:47:26.759612+00:00",
+      "note": "via Telegram"
+    }
+  ]
 }
