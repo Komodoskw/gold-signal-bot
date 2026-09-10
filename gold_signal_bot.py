@@ -19,12 +19,14 @@ MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 
-SL_USD = 3.0   # jarak Stop Loss dalam USD (harga gold), sesuaikan sesuai selera
-TP_USD = 6.0   # jarak Take Profit dalam USD
+SL_USD = 1.0   # jarak Stop Loss dalam USD (harga gold), sesuaikan sesuai selera
+TP_USD = 2.0   # jarak Take Profit dalam USD
 
 H1_INTERVAL = "1h"
 H1_EMA_FAST = 50
 H1_EMA_SLOW = 200
+
+STATUS_UPDATE_EVERY_MIN = 30  # kirim pesan status tiap berapa menit (harus kelipatan 5)
 
 STATE_FILE = "state.json"
 
@@ -116,52 +118,60 @@ def calculate_indicators(df):
     return df
 
 
-def detect_signal(df, h1_trend):
+def analyze(df, h1_trend):
     """
-    Pakai 2 candle yang SUDAH close (index -2 dan -3), skip candle terakhir
-    (-1) karena kemungkinan belum close saat data diambil.
-    Sinyal hanya diambil kalau searah dengan trend H1 (EMA50 vs EMA200).
+    Analisa kondisi M5 saat ini (pakai 2 candle yang sudah close: -2 dan -3,
+    skip -1 karena mungkin belum close). Selalu mengembalikan status kondisi
+    saat ini, plus objek "signal" hanya kalau ketiga syarat (MACD cross, RSI,
+    trend H1) benar-benar sejalan.
     """
     if len(df) < MACD_SLOW + MACD_SIGNAL + 5:
         return None  # data belum cukup buat hitung indikator stabil
-
-    if h1_trend is None:
-        return None  # data H1 belum cukup, skip demi keamanan
 
     prev = df.iloc[-3]
     curr = df.iloc[-2]
 
     bullish_cross = prev["macd"] < prev["macd_signal"] and curr["macd"] > curr["macd_signal"]
     bearish_cross = prev["macd"] > prev["macd_signal"] and curr["macd"] < curr["macd_signal"]
+    macd_bullish = curr["macd"] > curr["macd_signal"]
 
     rsi_bullish = curr["rsi"] > RSI_MIDLINE
-    rsi_bearish = curr["rsi"] < RSI_MIDLINE
 
     signal_time = str(curr["datetime"])
-    entry_price = float(curr["close"])
+    entry_price = round(float(curr["close"]), 2)
+    rsi_val = round(float(curr["rsi"]), 1)
 
-    # BUY hanya kalau trend H1 juga bullish, SELL hanya kalau trend H1 bearish
-    if bullish_cross and rsi_bullish and h1_trend == "bullish":
-        return {
+    signal = None
+    if h1_trend == "bullish" and bullish_cross and rsi_bullish:
+        signal = {
             "type": "BUY",
             "time": signal_time,
             "entry": entry_price,
             "sl": round(entry_price - SL_USD, 2),
             "tp": round(entry_price + TP_USD, 2),
-            "rsi": round(float(curr["rsi"]), 1),
+            "rsi": rsi_val,
             "h1_trend": h1_trend,
         }
-    elif bearish_cross and rsi_bearish and h1_trend == "bearish":
-        return {
+    elif h1_trend == "bearish" and bearish_cross and not rsi_bullish:
+        signal = {
             "type": "SELL",
             "time": signal_time,
             "entry": entry_price,
             "sl": round(entry_price + SL_USD, 2),
             "tp": round(entry_price - TP_USD, 2),
-            "rsi": round(float(curr["rsi"]), 1),
+            "rsi": rsi_val,
             "h1_trend": h1_trend,
         }
-    return None
+
+    return {
+        "time": signal_time,
+        "entry": entry_price,
+        "rsi": rsi_val,
+        "macd_bullish": macd_bullish,
+        "rsi_bullish": rsi_bullish,
+        "h1_trend": h1_trend,
+        "signal": signal,
+    }
 
 
 def load_state():
@@ -200,6 +210,32 @@ def format_message(signal):
     )
 
 
+def format_status_message(status):
+    macd_label = "Bullish 📈" if status["macd_bullish"] else "Bearish 📉"
+    rsi_label = "Bullish" if status["rsi_bullish"] else "Bearish"
+    trend_map = {"bullish": "Bullish 📈", "bearish": "Bearish 📉"}
+    trend_label = trend_map.get(status["h1_trend"], "Data belum cukup")
+
+    return (
+        f"📡 Status XAUUSD (M5)\n"
+        f"Harga: {status['entry']}\n"
+        f"RSI: {status['rsi']} ({rsi_label})\n"
+        f"MACD: {macd_label}\n"
+        f"Trend H1: {trend_label}\n"
+        f"Candle: {status['time']} UTC\n\n"
+        f"Belum ada sinyal entry valid saat ini."
+    )
+
+
+def is_status_update_time(candle_time_str, interval_minutes=STATUS_UPDATE_EVERY_MIN):
+    """Cek apakah candle saat ini jatuh di kelipatan interval_minutes (mis. :00 dan :30)."""
+    try:
+        t = pd.to_datetime(candle_time_str)
+        return t.minute % interval_minutes == 0
+    except Exception:
+        return True  # kalau gagal parse, aman-nya kirim saja
+
+
 def main():
     if not TWELVEDATA_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("Environment variable belum lengkap (API key / Telegram token / chat id).")
@@ -210,21 +246,32 @@ def main():
 
     df = fetch_candles()
     df = calculate_indicators(df)
-    signal = detect_signal(df, h1_trend)
+    status = analyze(df, h1_trend)
 
-    if signal is None:
-        print("Tidak ada sinyal baru saat ini (atau tidak searah trend H1).")
+    if status is None:
+        print("Data belum cukup buat dianalisa saat ini.")
         return
 
-    state = load_state()
-    if state.get("last_signal_time") == signal["time"]:
-        print("Sinyal untuk candle ini sudah pernah dikirim, skip.")
-        return
+    signal = status["signal"]
 
-    send_telegram(format_message(signal))
-    state["last_signal_time"] = signal["time"]
-    save_state(state)
-    print("Sinyal terkirim:", signal)
+    if signal is not None:
+        state = load_state()
+        if state.get("last_signal_time") == signal["time"]:
+            print("Sinyal untuk candle ini sudah pernah dikirim.")
+            if is_status_update_time(status["time"]):
+                send_telegram(format_status_message(status))
+        else:
+            send_telegram(format_message(signal))
+            state["last_signal_time"] = signal["time"]
+            save_state(state)
+            print("Sinyal terkirim:", signal)
+    else:
+        if is_status_update_time(status["time"]):
+            send_telegram(format_status_message(status))
+            print("Tidak ada sinyal valid, status terkirim.")
+        else:
+            print("Tidak ada sinyal valid, dan bukan waktu update status (tiap",
+                  STATUS_UPDATE_EVERY_MIN, "menit) - skip.")
 
 
 if __name__ == "__main__":
