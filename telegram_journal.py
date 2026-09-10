@@ -51,7 +51,11 @@ def get_updates(offset):
 
 def send_message(text):
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": TELEGRAM_CHAT_ID, "text": text}, timeout=15)
+    requests.post(
+        url,
+        data={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
+        timeout=15,
+    )
 
 
 def fmt_cent(c):
@@ -75,15 +79,42 @@ def compute_summary(journal):
     return wins, losses, total_pl, win_rate, balance, len(trades)
 
 
+def render_table(rows):
+    """rows: list of tuple/list, baris pertama = header. Return string tabel rata kolom (monospace)."""
+    col_count = len(rows[0])
+    widths = [max(len(str(row[i])) for row in rows) for i in range(col_count)]
+    lines = []
+    for idx, row in enumerate(rows):
+        cells = [str(row[i]).ljust(widths[i]) for i in range(col_count)]
+        lines.append("  ".join(cells).rstrip())
+        if idx == 0:
+            lines.append("  ".join("-" * widths[i] for i in range(col_count)))
+    return "\n".join(lines)
+
+
 def format_stats_message(journal):
+    trades = journal.get("trades", [])
     wins, losses, total_pl, win_rate, balance, total_trades = compute_summary(journal)
+    breakevens = sum(1 for t in trades if t["result"] == "breakeven")
+    win_pl = sum(t.get("plCents", 0) for t in trades if t["result"] == "win")
+    loss_pl = sum(t.get("plCents", 0) for t in trades if t["result"] == "loss")
+    be_pl = sum(t.get("plCents", 0) for t in trades if t["result"] == "breakeven")
+
+    rows = [
+        ("Hasil", "Jml", "P/L"),
+        ("Menang", str(wins), ("+" + fmt_cent(win_pl)) if wins else "-"),
+        ("Kalah", str(losses), fmt_cent(loss_pl) if losses else "-"),
+        ("BE", str(breakevens), fmt_cent(be_pl) if breakevens else "-"),
+    ]
+    table = render_table(rows)
     wr_text = f"{win_rate:.0f}%" if win_rate is not None else "-"
+
     lines = [
-        "📊 Ringkasan Jurnal",
+        "📊 <b>Ringkasan Jurnal</b>",
+        f"<pre>{table}</pre>",
         f"Saldo sekarang: {fmt_usd(balance)} ({fmt_cent(balance)})",
-        f"Win rate: {wr_text} ({wins}W / {losses}L)",
+        f"Win rate: {wr_text}",
         f"Total P/L: {'+' if total_pl >= 0 else ''}{fmt_cent(total_pl)}",
-        f"Total trade dicatat: {total_trades}",
     ]
     target = journal.get("targetBalanceCents")
     start = journal.get("startingBalanceCents")
@@ -91,6 +122,32 @@ def format_stats_message(journal):
         progress = max(0, min(1, (balance - start) / (target - start)))
         lines.append(f"Progres ke target {fmt_usd(target)}: {progress * 100:.0f}%")
     return "\n".join(lines)
+
+
+def format_history_message(journal, limit=10):
+    trades = journal.get("trades", [])
+    if not trades:
+        return "Belum ada trade tercatat. Ketik MENANG/KALAH/BE dulu buat mulai catat."
+
+    sorted_trades = sorted(trades, key=lambda t: t.get("dateTime", ""), reverse=True)[:limit]
+    result_label = {"win": "Menang", "loss": "Kalah", "breakeven": "BE", "pending": "Jalan"}
+
+    rows = [("Tgl", "Hasil", "P/L")]
+    for t in sorted_trades:
+        dt = t.get("dateTime", "")
+        try:
+            date_str = datetime.fromisoformat(dt).strftime("%d/%m")
+        except ValueError:
+            date_str = dt[:5] if dt else "-"
+        label = result_label.get(t["result"], t["result"])
+        pl = t.get("plCents", 0)
+        pl_str = ("+" + fmt_cent(pl)) if (t["result"] != "pending" and pl > 0) else (
+            fmt_cent(pl) if t["result"] != "pending" else "-"
+        )
+        rows.append((date_str, label, pl_str))
+
+    table = render_table(rows)
+    return f"🧾 <b>Riwayat Trade</b> (terakhir {len(sorted_trades)})\n<pre>{table}</pre>"
 
 
 def process_command(text, journal):
@@ -134,6 +191,9 @@ def process_command(text, journal):
     if cmd in ("stats", "statistik"):
         return format_stats_message(journal)
 
+    if cmd in ("riwayat", "history"):
+        return format_history_message(journal)
+
     if cmd in ("saldo", "setsaldo"):
         if len(parts) < 2:
             return "Format: /saldo <jumlah_cent>, misal: /saldo 766"
@@ -160,7 +220,8 @@ def process_command(text, journal):
             "MENANG <cent> - catat trade menang\n"
             "KALAH <cent> - catat trade kalah\n"
             "BE - catat breakeven\n"
-            "/stats - lihat ringkasan\n"
+            "/stats - lihat ringkasan (tabel)\n"
+            "/riwayat - lihat 10 trade terakhir (tabel)\n"
             "/saldo <cent> - set saldo awal\n"
             "/target <cent> - set target saldo"
         )
