@@ -25,6 +25,12 @@
       "plCents": -534.0,
       "dateTime": "2026-09-11T01:17:54.029009+00:00",
       "note": "via Telegram"
+    },
+    {
+      "result": "loss",
+      "plCents": -1.14,
+      "dateTime": "2026-09-11T02:04:57.168562+00:00",
+      "note": "via Telegram"
     }
   ]
 }
