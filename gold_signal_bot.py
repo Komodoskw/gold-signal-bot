@@ -87,4 +87,11 @@ def setlot(message):
     send_msg(f"Lot default diubah menjadi {default_lot}")
 
 @bot.message_handler(commands=['risk'])
-def setrisk(message
+def setrisk(message):
+    global risk_percent
+    args = message.text.split()
+    if len(args) < 2:
+        send_msg("Format salah. Gunakan: /risk PERCENT")
+        return
+    risk_percent = float(args[1])
+    send_msg(f"Risk management aktif: {risk_percent}% dari balance")
