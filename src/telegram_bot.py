@@ -1,51 +1,57 @@
-
 import telebot
-import json
 import schedule
 import time
-import threading
-from price_feed import get_gold_data
-from signal_generator import ema_crossover, rsi, macd, combined_signal, entry_with_levels
+from config.settings import TELEGRAM_TOKEN, CHAT_ID, SYMBOL, TIMEFRAME
+from src.price_feed import get_gold_data
+from src.signal_generator import entry_with_levels
 
-with open("config/settings.json") as f:
-    settings = json.load(f)
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-bot = telebot.TeleBot(settings["TELEGRAM_TOKEN"])
-CHAT_ID = settings["CHAT_ID"]
-
-def generate_report():
-    df = get_gold_data(symbol="XAUUSD=X", interval="5m", period="1d")
-    ema_signal = ema_crossover(df)
-    rsi_signal = rsi(df)
-    macd_signal = macd(df)
-    final_signal, price, sl, tp = entry_with_levels(df)
-
-    msg = (
-        f"📊 Auto‑Report {settings['SYMBOL']} {settings['TIMEFRAME']}:\n"
-        f"EMA: {ema_signal}\n"
-        f"RSI: {rsi_signal}\n"
-        f"MACD: {macd_signal}\n"
-        f"➡️ Rekomendasi Final: {final_signal}\n\n"
-        f"🎯 Entry: {final_signal} @ {price}\n"
-        f"🛑 SL: {sl}\n"
-        f"✅ TP: {tp}"
-    )
-    bot.send_message(CHAT_ID, msg)
-
+# Command manual: /signal
 @bot.message_handler(commands=['signal'])
 def send_signal(message):
-    generate_report()
+    df = get_gold_data(symbol=SYMBOL, interval=TIMEFRAME, period="5d")
+    if df.empty:
+        bot.send_message(CHAT_ID, "⚠️ Data kosong, tidak ada harga terbaru.")
+        return
+    entry = entry_with_levels(df)
+    if entry:
+        msg = (
+            f"📊 Signal {SYMBOL} {TIMEFRAME}\n"
+            f"➡️ {entry['signal']}\n"
+            f"🎯 Entry: {entry['entry']}\n"
+            f"🛑 SL: {entry['sl']}\n"
+            f"✅ TP: {entry['tp']}"
+        )
+        bot.send_message(CHAT_ID, msg)
 
-# Jadwal auto‑report harian (misalnya jam 09:00 WIB dan 15:00 WIB)
-schedule.every().day.at("09:00").do(generate_report)
-schedule.every().day.at("15:00").do(generate_report)
+# Auto-report harian
+def auto_report():
+    df = get_gold_data(symbol=SYMBOL, interval=TIMEFRAME, period="5d")
+    if df.empty:
+        bot.send_message(CHAT_ID, "⚠️ Data kosong, tidak ada harga terbaru.")
+        return
+    entry = entry_with_levels(df)
+    if entry:
+        msg = (
+            f"📊 Auto-Report {SYMBOL} {TIMEFRAME}\n"
+            f"➡️ {entry['signal']}\n"
+            f"🎯 Entry: {entry['entry']}\n"
+            f"🛑 SL: {entry['sl']}\n"
+            f"✅ TP: {entry['tp']}"
+        )
+        bot.send_message(CHAT_ID, msg)
 
-def run_schedule():
+# Jadwal auto-report (09:00 & 15:00 WIB)
+schedule.every().day.at("09:00").do(auto_report)
+schedule.every().day.at("15:00").do(auto_report)
+
+# Loop utama
+def run_bot():
     while True:
         schedule.run_pending()
         time.sleep(1)
+        bot.polling(none_stop=True)
 
-# Jalankan scheduler di thread terpisah
-threading.Thread(target=run_schedule).start()
-
-bot.polling()
+if __name__ == "__main__":
+    run_bot()
