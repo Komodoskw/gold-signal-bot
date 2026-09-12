@@ -1,4 +1,4 @@
 pyTelegramBotAPI
-MetaTrader5
 pandas
+numpy
 requests
