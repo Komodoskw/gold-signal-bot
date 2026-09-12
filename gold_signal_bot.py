@@ -1,278 +1,90 @@
-"""
-Gold Signal Bot - XAUUSD M5 RSI+MACD -> Telegram
-Dijalankan terjadwal (tiap 5 menit) lewat GitHub Actions.
-Tidak melakukan auto-entry - hanya mengirim SINYAL (entry, SL, TP) ke Telegram.
-"""
-
-import os
+import telebot
+import time
+import threading
 import json
-import sys
-import requests
-import pandas as pd
+from signal_generator import check_signal
+from trade_manager import connect_mt5, execute_order, close_all_positions, set_sl_tp
 
-# ============== KONFIGURASI ==============
-SYMBOL = "XAU/USD"
-INTERVAL = "5min"
-RSI_PERIOD = 14
-RSI_MIDLINE = 50.0
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
+# --- Load konfigurasi ---
+with open("config/settings.json") as f:
+    config = json.load(f)
 
-SL_USD = 1.0   # jarak Stop Loss dalam USD (harga gold), sesuaikan sesuai selera
-TP_USD = 2.0   # jarak Take Profit dalam USD
+TELEGRAM_TOKEN = config["TELEGRAM_TOKEN"]
+CHAT_ID = config["CHAT_ID"]
+SYMBOL = config["SYMBOL"]
+TIMEFRAME = config["TIMEFRAME"]
+MT5_LOGIN = config["MT5_LOGIN"]
+MT5_PASSWORD = config["MT5_PASSWORD"]
+MT5_SERVER = config["MT5_SERVER"]
 
-H1_INTERVAL = "1h"
-H1_EMA_FAST = 50
-H1_EMA_SLOW = 200
+bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-STATUS_UPDATE_EVERY_MIN = 30  # kirim pesan status tiap berapa menit (harus kelipatan 5)
+# --- Connect MT5 ---
+connect_mt5(MT5_LOGIN, MT5_PASSWORD, MT5_SERVER)
 
-STATE_FILE = "state.json"
+running = True
+default_lot = 0.01
+risk_percent = None
 
-TWELVEDATA_API_KEY = os.environ.get("TWELVEDATA_API_KEY")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
+def send_msg(text):
+    bot.send_message(CHAT_ID, text)
 
+# --- Command Telegram ---
+@bot.message_handler(commands=['pause'])
+def pause(message):
+    global running
+    running = False
+    send_msg("Bot trading PAUSED")
 
-def fetch_candles():
-    """Ambil data candle XAUUSD M5 dari TwelveData."""
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": SYMBOL,
-        "interval": INTERVAL,
-        "outputsize": 100,
-        "apikey": TWELVEDATA_API_KEY,
-    }
-    resp = requests.get(url, params=params, timeout=20)
-    data = resp.json()
+@bot.message_handler(commands=['resume'])
+def resume(message):
+    global running
+    running = True
+    send_msg("Bot trading RESUMED")
 
-    if data.get("status") == "error" or "values" not in data:
-        print("Gagal ambil data:", data)
-        sys.exit(1)
+@bot.message_handler(commands=['report'])
+def report(message):
+    import MetaTrader5 as mt5
+    info = mt5.account_info()
+    send_msg(f"Report:\nBalance: {info.balance}\nEquity: {info.equity}")
 
-    df = pd.DataFrame(data["values"])
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df["close"] = df["close"].astype(float)
-    df = df.sort_values("datetime").reset_index(drop=True)  # urut lama -> baru
-    return df
+@bot.message_handler(commands=['closeall'])
+def closeall(message):
+    result = close_all_positions()
+    send_msg(result)
 
-
-def fetch_h1_trend():
-    """
-    Ambil data H1 dan tentukan arah trend besar pakai EMA50 vs EMA200.
-    Return "bullish", "bearish", atau None kalau data belum cukup.
-    """
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": SYMBOL,
-        "interval": H1_INTERVAL,
-        "outputsize": H1_EMA_SLOW + 20,
-        "apikey": TWELVEDATA_API_KEY,
-    }
-    resp = requests.get(url, params=params, timeout=20)
-    data = resp.json()
-
-    if data.get("status") == "error" or "values" not in data:
-        print("Gagal ambil data H1:", data)
-        return None
-
-    df = pd.DataFrame(data["values"])
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df["close"] = df["close"].astype(float)
-    df = df.sort_values("datetime").reset_index(drop=True)
-
-    if len(df) < H1_EMA_SLOW + 5:
-        return None  # data H1 belum cukup buat EMA200 stabil
-
-    ema_fast = df["close"].ewm(span=H1_EMA_FAST, adjust=False).mean()
-    ema_slow = df["close"].ewm(span=H1_EMA_SLOW, adjust=False).mean()
-
-    # pakai candle H1 yang sudah close (-2), skip yang mungkin masih jalan (-1)
-    if ema_fast.iloc[-2] > ema_slow.iloc[-2]:
-        return "bullish"
-    elif ema_fast.iloc[-2] < ema_slow.iloc[-2]:
-        return "bearish"
-    return None
-
-
-def calculate_indicators(df):
-    """Hitung RSI dan MACD, tambahkan sebagai kolom baru."""
-    close = df["close"]
-
-    # RSI (Wilder smoothing)
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1 / RSI_PERIOD, min_periods=RSI_PERIOD).mean()
-    avg_loss = loss.ewm(alpha=1 / RSI_PERIOD, min_periods=RSI_PERIOD).mean()
-    rs = avg_gain / avg_loss
-    df["rsi"] = 100 - (100 / (1 + rs))
-
-    # MACD
-    ema_fast = close.ewm(span=MACD_FAST, adjust=False).mean()
-    ema_slow = close.ewm(span=MACD_SLOW, adjust=False).mean()
-    df["macd"] = ema_fast - ema_slow
-    df["macd_signal"] = df["macd"].ewm(span=MACD_SIGNAL, adjust=False).mean()
-
-    return df
-
-
-def analyze(df, h1_trend):
-    """
-    Analisa kondisi M5 saat ini (pakai 2 candle yang sudah close: -2 dan -3,
-    skip -1 karena mungkin belum close). Selalu mengembalikan status kondisi
-    saat ini, plus objek "signal" hanya kalau ketiga syarat (MACD cross, RSI,
-    trend H1) benar-benar sejalan.
-    """
-    if len(df) < MACD_SLOW + MACD_SIGNAL + 5:
-        return None  # data belum cukup buat hitung indikator stabil
-
-    prev = df.iloc[-3]
-    curr = df.iloc[-2]
-
-    bullish_cross = prev["macd"] < prev["macd_signal"] and curr["macd"] > curr["macd_signal"]
-    bearish_cross = prev["macd"] > prev["macd_signal"] and curr["macd"] < curr["macd_signal"]
-    macd_bullish = curr["macd"] > curr["macd_signal"]
-
-    rsi_bullish = curr["rsi"] > RSI_MIDLINE
-
-    signal_time = str(curr["datetime"])
-    entry_price = round(float(curr["close"]), 2)
-    rsi_val = round(float(curr["rsi"]), 1)
-
-    signal = None
-    if h1_trend == "bullish" and bullish_cross and rsi_bullish:
-        signal = {
-            "type": "BUY",
-            "time": signal_time,
-            "entry": entry_price,
-            "sl": round(entry_price - SL_USD, 2),
-            "tp": round(entry_price + TP_USD, 2),
-            "rsi": rsi_val,
-            "h1_trend": h1_trend,
-        }
-    elif h1_trend == "bearish" and bearish_cross and not rsi_bullish:
-        signal = {
-            "type": "SELL",
-            "time": signal_time,
-            "entry": entry_price,
-            "sl": round(entry_price + SL_USD, 2),
-            "tp": round(entry_price - TP_USD, 2),
-            "rsi": rsi_val,
-            "h1_trend": h1_trend,
-        }
-
-    return {
-        "time": signal_time,
-        "entry": entry_price,
-        "rsi": rsi_val,
-        "macd_bullish": macd_bullish,
-        "rsi_bullish": rsi_bullish,
-        "h1_trend": h1_trend,
-        "signal": signal,
-    }
-
-
-def load_state():
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    return {"last_signal_time": None}
-
-
-def save_state(state):
-    with open(STATE_FILE, "w") as f:
-        json.dump(state, f)
-
-
-def send_telegram(message):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message}
-    r = requests.post(url, data=payload, timeout=15)
-    if r.status_code != 200:
-        print("Gagal kirim Telegram:", r.text)
-
-
-def format_message(signal):
-    emoji = "🟢 BUY" if signal["type"] == "BUY" else "🔴 SELL"
-    trend_label = "Bullish 📈" if signal["h1_trend"] == "bullish" else "Bearish 📉"
-    return (
-        f"{emoji} XAUUSD (M5)\n"
-        f"Entry: {signal['entry']}\n"
-        f"SL: {signal['sl']}\n"
-        f"TP: {signal['tp']}\n"
-        f"RSI: {signal['rsi']}\n"
-        f"Trend H1: {trend_label}\n"
-        f"Candle: {signal['time']} UTC\n\n"
-        f"⚠️ Sinyal otomatis, entry manual di MT5. Harga real bisa sedikit beda "
-        f"dari harga di sinyal ini, cek ulang sebelum entry."
-    )
-
-
-def format_status_message(status):
-    macd_label = "Bullish 📈" if status["macd_bullish"] else "Bearish 📉"
-    rsi_label = "Bullish" if status["rsi_bullish"] else "Bearish"
-    trend_map = {"bullish": "Bullish 📈", "bearish": "Bearish 📉"}
-    trend_label = trend_map.get(status["h1_trend"], "Data belum cukup")
-
-    return (
-        f"📡 Status XAUUSD (M5)\n"
-        f"Harga: {status['entry']}\n"
-        f"RSI: {status['rsi']} ({rsi_label})\n"
-        f"MACD: {macd_label}\n"
-        f"Trend H1: {trend_label}\n"
-        f"Candle: {status['time']} UTC\n\n"
-        f"Belum ada sinyal entry valid saat ini."
-    )
-
-
-def is_status_update_time(candle_time_str, interval_minutes=STATUS_UPDATE_EVERY_MIN):
-    """Cek apakah candle saat ini jatuh di kelipatan interval_minutes (mis. :00 dan :30)."""
-    try:
-        t = pd.to_datetime(candle_time_str)
-        return t.minute % interval_minutes == 0
-    except Exception:
-        return True  # kalau gagal parse, aman-nya kirim saja
-
-
-def main():
-    if not TWELVEDATA_API_KEY or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("Environment variable belum lengkap (API key / Telegram token / chat id).")
-        sys.exit(1)
-
-    h1_trend = fetch_h1_trend()
-    print("Trend H1 saat ini:", h1_trend)
-
-    df = fetch_candles()
-    df = calculate_indicators(df)
-    status = analyze(df, h1_trend)
-
-    if status is None:
-        print("Data belum cukup buat dianalisa saat ini.")
+@bot.message_handler(commands=['setsl'])
+def setsl(message):
+    args = message.text.split()
+    if len(args) < 3:
+        send_msg("Format salah. Gunakan: /setsl SYMBOL PRICE")
         return
+    symbol = args[1]
+    sl_price = float(args[2])
+    result = set_sl_tp(symbol, sl=sl_price)
+    send_msg(result)
 
-    signal = status["signal"]
+@bot.message_handler(commands=['settp'])
+def settp(message):
+    args = message.text.split()
+    if len(args) < 3:
+        send_msg("Format salah. Gunakan: /settp SYMBOL PRICE")
+        return
+    symbol = args[1]
+    tp_price = float(args[2])
+    result = set_sl_tp(symbol, tp=tp_price)
+    send_msg(result)
 
-    if signal is not None:
-        state = load_state()
-        if state.get("last_signal_time") == signal["time"]:
-            print("Sinyal untuk candle ini sudah pernah dikirim.")
-            if is_status_update_time(status["time"]):
-                send_telegram(format_status_message(status))
-        else:
-            send_telegram(format_message(signal))
-            state["last_signal_time"] = signal["time"]
-            save_state(state)
-            print("Sinyal terkirim:", signal)
-    else:
-        if is_status_update_time(status["time"]):
-            send_telegram(format_status_message(status))
-            print("Tidak ada sinyal valid, status terkirim.")
-        else:
-            print("Tidak ada sinyal valid, dan bukan waktu update status (tiap",
-                  STATUS_UPDATE_EVERY_MIN, "menit) - skip.")
+@bot.message_handler(commands=['setlot'])
+def setlot(message):
+    global default_lot, risk_percent
+    args = message.text.split()
+    if len(args) < 2:
+        send_msg("Format salah. Gunakan: /setlot LOTSIZE")
+        return
+    default_lot = float(args[1])
+    risk_percent = None
+    send_msg(f"Lot default diubah menjadi {default_lot}")
 
-
-if __name__ == "__main__":
-    main()
+@bot.message_handler(commands=['risk'])
+def setrisk(message
