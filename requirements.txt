@@ -1,2 +1,4 @@
-requests
+pyTelegramBotAPI
+MetaTrader5
 pandas
+requests
